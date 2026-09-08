@@ -98,16 +98,19 @@ async def resolve_chat(client: TelegramClient, chat_ref: str):
     )
 
 
-async def handle_message(event, chat_title: str, client: TelegramClient, archive_entity=None):
+async def handle_message(event, chat_title: str, client: TelegramClient, archive_entity=None, archive_topic_id: int | None = None):
     text = event.raw_text or ""
 
     # Дублируем КАЖДОЕ сообщение с текстом в архивный чат (если он задан),
     # независимо от того, похоже оно на сигнал или нет — это не пересылка
     # (forward), а обычная отправка нового сообщения с тем же текстом, так
-    # что запрет пересылки в исходном чате тут ни при чём.
+    # что запрет пересылки в исходном чате тут ни при чём. Если задан
+    # ARCHIVE_TOPIC_ID — отправляем в конкретную тему форум-чата: reply_to
+    # на id темы кладёт сообщение именно в неё (так же работает и в ботах
+    # через message_thread_id).
     if archive_entity is not None and text.strip():
         try:
-            await client.send_message(archive_entity, text)
+            await client.send_message(archive_entity, text, reply_to=archive_topic_id)
         except Exception:
             logger.exception("Не удалось продублировать сообщение в архивный чат")
 
@@ -166,15 +169,21 @@ async def main():
 
     archive_ref = os.getenv("ARCHIVE_CHAT")
     archive_entity = None
+    archive_topic_id = None
     if archive_ref:
         archive_entity = await resolve_chat(client, archive_ref)
         archive_title = getattr(archive_entity, "title", None) or getattr(archive_entity, "username", archive_ref)
-        logger.info("Дублирую все сообщения чата в: %s", archive_title)
+        topic_raw = os.getenv("ARCHIVE_TOPIC_ID")
+        if topic_raw:
+            archive_topic_id = int(topic_raw)
+            logger.info("Дублирую все сообщения чата в: %s (тема %s)", archive_title, archive_topic_id)
+        else:
+            logger.info("Дублирую все сообщения чата в: %s", archive_title)
 
     @client.on(events.NewMessage(chats=chat_entity))
     async def _handler(event):
         try:
-            await handle_message(event, chat_title, client, archive_entity)
+            await handle_message(event, chat_title, client, archive_entity, archive_topic_id)
         except Exception:
             logger.exception("Ошибка при обработке сообщения")
 
