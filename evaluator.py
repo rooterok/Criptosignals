@@ -141,7 +141,7 @@ def _evaluate_openai(text: str, context: list[str] | None, api_key: str) -> dict
 
     resp = client.chat.completions.create(
         model=model,
-        max_tokens=300,
+        max_completion_tokens=300,
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
