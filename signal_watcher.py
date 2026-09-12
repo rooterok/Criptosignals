@@ -14,13 +14,11 @@ import asyncio
 import base64
 import logging
 import os
-import random
 import sys
 from collections import deque
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
-from telethon.tl import functions
 
 from evaluator import evaluate
 from notifier import send_push
@@ -162,21 +160,18 @@ async def handle_mirror_message(
     """Простое зеркалирование БЕЗ анализа на сигналы — для дополнительных
     источников, которые нужно просто копировать в архив, а не мониторить.
 
-    Картинки (фото) пересылаются НАСТОЯЩИМ Forward — с пометкой "Переслано
-    от...", сохранением автора и качества изображения (годится только если
-    в исходном чате не запрещена пересылка). Обычный текст без фото
-    отправляется новым сообщением от вашего имени (просто копия текста, без
-    пометки "Переслано от...")."""
+    Всё уходит НОВЫМ сообщением от вашего имени (без пометки "Переслано
+    от..."): картинка пересылается через send_file по её file-ссылке (без
+    повторной загрузки/потери качества, просто без штампа авторства), а
+    обычный текст — простой копией текста."""
     try:
         if event.message.photo:
-            await client(
-                functions.messages.ForwardMessagesRequest(
-                    from_peer=source_entity,
-                    id=[event.message.id],
-                    to_peer=target_entity,
-                    top_msg_id=target_topic_id,
-                    random_id=[random.randrange(-(2**63), 2**63)],
-                )
+            text = event.raw_text or ""
+            await client.send_file(
+                target_entity,
+                event.message.photo,
+                caption=text or None,
+                reply_to=target_topic_id,
             )
             return
 
@@ -231,7 +226,6 @@ async def main():
     # MIRROR2_TARGET_TOPIC_ID, если она задана. Понадобится ещё один такой
     # источник — добавляйте по аналогии MIRROR3_* и т.д.
     mirror2_source_ref = os.getenv("MIRROR2_SOURCE_CHAT")
-    logger.info("DEBUG MIRROR2_SOURCE_CHAT=%r", mirror2_source_ref)
     if mirror2_source_ref:
         try:
             mirror2_target_ref = os.getenv("MIRROR2_TARGET_CHAT") or archive_ref
