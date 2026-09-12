@@ -14,11 +14,13 @@ import asyncio
 import base64
 import logging
 import os
+import random
 import sys
 from collections import deque
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.tl import functions
 
 from evaluator import evaluate
 from notifier import send_push
@@ -150,6 +152,42 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
     send_push(title=title, message=f"[{chat_title}] {message}", url=chat_link)
 
 
+async def handle_mirror_message(
+    event,
+    client: TelegramClient,
+    source_entity,
+    target_entity,
+    target_topic_id: int | None = None,
+):
+    """Простое зеркалирование БЕЗ анализа на сигналы — для дополнительных
+    источников, которые нужно просто копировать в архив, а не мониторить.
+
+    Картинки (фото) пересылаются НАСТОЯЩИМ Forward — с пометкой "Переслано
+    от...", сохранением автора и качества изображения (годится только если
+    в исходном чате не запрещена пересылка). Обычный текст без фото
+    отправляется новым сообщением от вашего имени (просто копия текста, без
+    пометки "Переслано от...")."""
+    try:
+        if event.message.photo:
+            await client(
+                functions.messages.ForwardMessagesRequest(
+                    from_peer=source_entity,
+                    id=[event.message.id],
+                    to_peer=target_entity,
+                    top_msg_id=target_topic_id,
+                    random_id=[random.randrange(-(2**63), 2**63)],
+                )
+            )
+            return
+
+        text = event.raw_text or ""
+        if not text.strip():
+            return
+        await client.send_message(target_entity, text, reply_to=target_topic_id)
+    except Exception:
+        logger.exception("Не удалось продублировать сообщение из доп. источника")
+
+
 async def main():
     api_id = int(_require_env("TELEGRAM_API_ID"))
     api_hash = _require_env("TELEGRAM_API_HASH")
@@ -186,6 +224,54 @@ async def main():
             await handle_message(event, chat_title, client, archive_entity, archive_topic_id)
         except Exception:
             logger.exception("Ошибка при обработке сообщения")
+
+    # Доп. источник(и) только для дублирования, без анализа на сигналы —
+    # MIRROR2_SOURCE_CHAT копируется в MIRROR2_TARGET_CHAT (по умолчанию
+    # туда же, куда и основной архив — ARCHIVE_CHAT), в тему
+    # MIRROR2_TARGET_TOPIC_ID, если она задана. Понадобится ещё один такой
+    # источник — добавляйте по аналогии MIRROR3_* и т.д.
+    mirror2_source_ref = os.getenv("MIRROR2_SOURCE_CHAT")
+    logger.info("DEBUG MIRROR2_SOURCE_CHAT=%r", mirror2_source_ref)
+    if mirror2_source_ref:
+        try:
+            mirror2_target_ref = os.getenv("MIRROR2_TARGET_CHAT") or archive_ref
+            if not mirror2_target_ref:
+                logger.error(
+                    "MIRROR2_SOURCE_CHAT задан, но не задан ни MIRROR2_TARGET_CHAT, ни ARCHIVE_CHAT"
+                )
+            else:
+                mirror2_source_entity = await resolve_chat(client, mirror2_source_ref)
+                mirror2_target_entity = await resolve_chat(client, mirror2_target_ref)
+                mirror2_topic_raw = os.getenv("MIRROR2_TARGET_TOPIC_ID")
+                mirror2_topic_id = int(mirror2_topic_raw) if mirror2_topic_raw else None
+
+                mirror2_source_title = getattr(mirror2_source_entity, "title", None) or getattr(
+                    mirror2_source_entity, "username", mirror2_source_ref
+                )
+                mirror2_target_title = getattr(mirror2_target_entity, "title", None) or getattr(
+                    mirror2_target_entity, "username", mirror2_target_ref
+                )
+                logger.info(
+                    "Доп. дублирование: %s -> %s (тема %s)",
+                    mirror2_source_title,
+                    mirror2_target_title,
+                    mirror2_topic_id,
+                )
+
+                @client.on(events.NewMessage(chats=mirror2_source_entity))
+                async def _mirror2_handler(event):
+                    try:
+                        await handle_mirror_message(
+                            event, client, mirror2_source_entity, mirror2_target_entity, mirror2_topic_id
+                        )
+                    except Exception:
+                        logger.exception("Ошибка при дублировании доп. источника")
+        except Exception:
+            logger.exception(
+                "Не удалось настроить доп. источник дублирования (MIRROR2_SOURCE_CHAT=%r) — "
+                "проверьте, что chat id верный и аккаунт состоит в этом чате",
+                mirror2_source_ref,
+            )
 
     logger.info("Готов. Ожидаю новые сообщения...")
     await client.run_until_disconnected()
