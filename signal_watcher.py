@@ -132,7 +132,16 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
     # в архиве тоже оформляется как ответ именно на ту копию, а не просто
     # падает в общую тему. Если пары нет (например, ответ на сообщение из
     # истории до запуска скрипта) — просто уходит в тему, как раньше.
-    if archive_entity is not None and text.strip():
+    #
+    # Картинки: в этом чате пересылка запрещена (noforwards), поэтому
+    # Forward и переиспользование file_reference (как в handle_mirror_message)
+    # тут не сработают — Telegram специально блокирует именно это. Обходим
+    # так же, как обычный человек делает вручную: скачиваем байты фото и
+    # заливаем их заново как новый, свой собственный файл — это уже не
+    # "пересылка" и не переиспользование чужого file_reference, а обычная
+    # загрузка, так что запрет тут ни при чём.
+    has_photo = bool(event.message.photo)
+    if archive_entity is not None and (text.strip() or has_photo):
         try:
             reply_source_id = getattr(event.message, "reply_to_msg_id", None)
             archived_parent_id = _archived_message_ids.get(reply_source_id) if reply_source_id else None
@@ -145,7 +154,14 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
             else:
                 reply_to = archive_topic_id
 
-            sent = await client.send_message(archive_entity, text, reply_to=reply_to)
+            if has_photo:
+                photo_bytes = await client.download_media(event.message, file=bytes)
+                sent = await client.send_file(
+                    archive_entity, photo_bytes, caption=text or None, reply_to=reply_to
+                )
+            else:
+                sent = await client.send_message(archive_entity, text, reply_to=reply_to)
+
             _remember_archived_id(event.message.id, sent.id)
         except Exception:
             logger.exception("Не удалось продублировать сообщение в архивный чат")
