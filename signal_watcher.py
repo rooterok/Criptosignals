@@ -14,11 +14,14 @@ import asyncio
 import base64
 import logging
 import os
+import random
 import sys
 from collections import deque
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
+from telethon.tl import types as tl_types
+from telethon.tl.functions.messages import SendMediaRequest, SendMessageRequest
 from telethon.tl.types import InputReplyToMessage
 
 from evaluator import evaluate
@@ -49,6 +52,57 @@ def _remember_archived_id(source_id: int, archived_id: int) -> None:
     if len(_archived_message_ids) > ARCHIVE_MAP_SIZE:
         oldest_key = next(iter(_archived_message_ids))
         del _archived_message_ids[oldest_key]
+
+
+async def _send_as_reply_to_archived(
+    client: TelegramClient,
+    entity,
+    text: str,
+    archive_topic_id: int,
+    archived_parent_id: int,
+    photo_bytes: bytes | None = None,
+):
+    """Отправляет сообщение (текст или фото) НАСТОЯЩИМ ответом на конкретное
+    уже заархивированное сообщение (archived_parent_id), оставаясь при этом
+    в нужной теме форума (archive_topic_id).
+
+    client.send_message()/client.send_file() тут не подходят: их reply_to
+    проходит через telethon.utils.get_message_id(), который принимает
+    только int или Message и падает с TypeError на InputReplyToMessage —
+    а чтобы ответить именно на сообщение ВНУТРИ темы (а не на само
+    открывающее сообщение темы), протоколу нужен InputReplyToMessage сразу
+    с reply_to_msg_id И top_msg_id. Высокоуровневый API так не умеет,
+    поэтому собираем запрос вручную через сырое Telegram API (как это и
+    делает Telethon внутри send_message/send_file, только с нужным
+    reply_to)."""
+    input_entity = await client.get_input_entity(entity)
+    reply_to = InputReplyToMessage(
+        reply_to_msg_id=archived_parent_id,
+        top_msg_id=archive_topic_id,
+    )
+    random_id = random.randrange(-(2**63), 2**63 - 1)
+
+    if photo_bytes is not None:
+        uploaded = await client.upload_file(photo_bytes)
+        media = tl_types.InputMediaUploadedPhoto(file=uploaded)
+        request = SendMediaRequest(
+            peer=input_entity,
+            media=media,
+            message=text or "",
+            reply_to=reply_to,
+            random_id=random_id,
+        )
+    else:
+        request = SendMessageRequest(
+            peer=input_entity,
+            message=text,
+            reply_to=reply_to,
+            random_id=random_id,
+        )
+
+    result = await client(request)
+    return client._get_response_message(request, result, input_entity)
+
 
 LOG_FILE = os.getenv("LOG_FILE", "signal_watcher.log")
 
@@ -146,21 +200,23 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
             reply_source_id = getattr(event.message, "reply_to_msg_id", None)
             archived_parent_id = _archived_message_ids.get(reply_source_id) if reply_source_id else None
 
-            if archived_parent_id is not None:
-                reply_to = InputReplyToMessage(
-                    reply_to_msg_id=archived_parent_id,
-                    top_msg_id=archive_topic_id,
-                )
-            else:
-                reply_to = archive_topic_id
-
+            photo_bytes = None
             if has_photo:
                 photo_bytes = await client.download_media(event.message, file=bytes)
+
+            if archived_parent_id is not None:
+                # Настоящий ответ на конкретное заархивированное сообщение —
+                # client.send_message/send_file тут не подходят, см.
+                # docstring _send_as_reply_to_archived.
+                sent = await _send_as_reply_to_archived(
+                    client, archive_entity, text, archive_topic_id, archived_parent_id, photo_bytes
+                )
+            elif has_photo:
                 sent = await client.send_file(
-                    archive_entity, photo_bytes, caption=text or None, reply_to=reply_to
+                    archive_entity, photo_bytes, caption=text or None, reply_to=archive_topic_id
                 )
             else:
-                sent = await client.send_message(archive_entity, text, reply_to=reply_to)
+                sent = await client.send_message(archive_entity, text, reply_to=archive_topic_id)
 
             _remember_archived_id(event.message.id, sent.id)
         except Exception:
