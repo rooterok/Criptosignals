@@ -113,6 +113,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("signal_watcher")
 
+# Раз уже бывало: скрипт молча "зависал" (Telethon переставал получать
+# обновления от Telegram без единой ошибки в логах), а Railway всё равно
+# показывал "всё ок", потому что сам процесс не падал — просто ничего не
+# делал. Из-за этого пропускались сигналы и пуши. Защита: раз в
+# WATCHDOG_INTERVAL_SECONDS дёргаем Telegram лёгким запросом (get_me) с
+# таймаутом WATCHDOG_TIMEOUT_SECONDS. Если он не проходит — значит
+# соединение мертво, и надёжнее всего просто убить процесс целиком:
+# внешний цикл в самом низу файла (while True: ... time.sleep(30))
+# поднимет его заново с чистого листа и новым соединением.
+WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "300"))
+WATCHDOG_TIMEOUT_SECONDS = int(os.getenv("WATCHDOG_TIMEOUT_SECONDS", "30"))
+
+
+async def _connection_watchdog(client: TelegramClient):
+    while True:
+        await asyncio.sleep(WATCHDOG_INTERVAL_SECONDS)
+        try:
+            await asyncio.wait_for(client.get_me(), timeout=WATCHDOG_TIMEOUT_SECONDS)
+        except Exception:
+            logger.exception(
+                "Watchdog: Telegram не отвечает дольше %s сек — похоже, соединение "
+                "молча умерло. Принудительно завершаю процесс, чтобы внешний цикл "
+                "перезапустил его с чистого листа",
+                WATCHDOG_TIMEOUT_SECONDS,
+            )
+            os._exit(1)
+
 
 SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "signal_watcher")
 
@@ -374,6 +401,8 @@ async def main():
                 "проверьте, что chat id верный и аккаунт состоит в этом чате",
                 mirror2_source_ref,
             )
+
+    asyncio.create_task(_connection_watchdog(client))
 
     logger.info("Готов. Ожидаю новые сообщения...")
     await client.run_until_disconnected()
