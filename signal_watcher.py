@@ -15,8 +15,11 @@ import base64
 import logging
 import os
 import random
+import re
 import sys
+import time
 from collections import deque
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -45,6 +48,36 @@ _recent_messages: deque[str] = deque(maxlen=CONTEXT_SIZE)
 # случится, копия просто уйдёт в общую тему, без реплая).
 ARCHIVE_MAP_SIZE = 2000
 _archived_message_ids: dict[int, int] = {}
+
+# Временная заглушка пуш-уведомлений (Pushover) — управляется командами
+# /mute, /unmute, /mutestatus, отправленными себе в Избранное (Saved
+# Messages). На дублирование сообщений в архивный чат и на сам мониторинг
+# это НЕ влияет — заглушается только звонок в Pushover, если сигнал
+# всё-таки найден.
+_push_muted_until: float | None = None
+DEFAULT_MUTE_SECONDS = int(os.getenv("DEFAULT_MUTE_SECONDS", str(60 * 60)))
+
+
+def _parse_duration_to_seconds(text: str) -> int | None:
+    """Парсит '1h', '90m', '2ч', '30 мин', '1ч30м' и т.п. в секунды.
+    Пустая строка/непонятный формат -> None."""
+    text = text.strip().lower().replace(" ", "")
+    if not text:
+        return None
+
+    total = 0
+    matched = False
+    for value, unit in re.findall(r"(\d+)\s*(ч|час\w*|h|м|мин\w*|m)?", text):
+        if not value:
+            continue
+        matched = True
+        n = int(value)
+        unit = unit or "h"
+        if unit.startswith(("м", "m")):
+            total += n * 60
+        else:
+            total += n * 3600
+    return total if matched and total > 0 else None
 
 
 def _remember_archived_id(source_id: int, archived_id: int) -> None:
@@ -282,6 +315,11 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
     if getattr(event.chat, "username", None):
         chat_link = f"https://t.me/{event.chat.username}"
 
+    if _push_muted_until and time.time() < _push_muted_until:
+        until_str = datetime.fromtimestamp(_push_muted_until).strftime("%H:%M")
+        logger.info("Пуш подавлен (заглушено до %s): %s", until_str, title)
+        return
+
     send_push(title=title, message=f"[{chat_title}] {message}", url=chat_link)
 
 
@@ -354,6 +392,45 @@ async def main():
             await handle_message(event, chat_title, client, archive_entity, archive_topic_id)
         except Exception:
             logger.exception("Ошибка при обработке сообщения")
+
+    # Команды управления пушами — пишете себе в Избранное (Saved Messages):
+    #   /mute        — заглушить на DEFAULT_MUTE_SECONDS (по умолчанию 1 час)
+    #   /mute 2h     — заглушить на 2 часа
+    #   /mute 90m    — заглушить на 90 минут (можно и "90 мин", "2ч30м" и т.п.)
+    #   /unmute      — снять заглушку сразу
+    #   /mutestatus  — посмотреть текущее состояние
+    # На дублирование в архив это не влияет — только на звонок в Pushover.
+    @client.on(events.NewMessage(chats="me", outgoing=True))
+    async def _control_handler(event):
+        global _push_muted_until
+        text = (event.raw_text or "").strip()
+        lowered = text.lower()
+
+        try:
+            if lowered.startswith("/mute"):
+                arg = text[len("/mute"):].strip()
+                seconds = _parse_duration_to_seconds(arg) if arg else DEFAULT_MUTE_SECONDS
+                if seconds is None:
+                    await event.reply("Не понял длительность. Примеры: /mute, /mute 2h, /mute 90m")
+                    return
+                _push_muted_until = time.time() + seconds
+                until_str = datetime.fromtimestamp(_push_muted_until).strftime("%H:%M")
+                logger.info("Пуши заглушены на %s сек (до %s)", seconds, until_str)
+                await event.reply(f"🔇 Пуши заглушены до {until_str}")
+
+            elif lowered.startswith("/unmute"):
+                _push_muted_until = None
+                logger.info("Пуши снова включены (команда /unmute)")
+                await event.reply("🔔 Пуши снова включены")
+
+            elif lowered.startswith("/mutestatus"):
+                if _push_muted_until and time.time() < _push_muted_until:
+                    until_str = datetime.fromtimestamp(_push_muted_until).strftime("%H:%M")
+                    await event.reply(f"🔇 Пуши заглушены до {until_str}")
+                else:
+                    await event.reply("🔔 Пуши включены")
+        except Exception:
+            logger.exception("Ошибка при обработке команды управления пушами: %r", text)
 
     # Доп. источник(и) только для дублирования, без анализа на сигналы —
     # MIRROR2_SOURCE_CHAT копируется в MIRROR2_TARGET_CHAT (по умолчанию
