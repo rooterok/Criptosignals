@@ -188,10 +188,16 @@ def _require_env(name: str) -> str:
 def _restore_session_from_env() -> None:
     """На хостинге вроде Railway нет интерактивного терминала для первого
     логина, поэтому файл сессии создаётся один раз локально (см. README,
-    раздел про Railway), кодируется в base64 и кладётся в переменную
+    раздел про Railway), кодируется в base64 и кладётся в переменную(ые)
     окружения TELEGRAM_SESSION_B64. При каждом старте контейнера, если
     локального файла сессии ещё нет, мы восстанавливаем его из этой
-    переменной — дальше Telethon подключается уже без повторного логина."""
+    переменной — дальше Telethon подключается уже без повторного логина.
+
+    У Railway есть лимит на длину значения переменной (32768 символов), а
+    base64 нашей сессии обычно его превышает. Поэтому, если TELEGRAM_SESSION_B64
+    целиком не задан, пробуем собрать его из пронумерованных частей
+    TELEGRAM_SESSION_B64_1, TELEGRAM_SESSION_B64_2, ... — каждая часть
+    укладывается в лимит, а здесь мы их склеиваем обратно по порядку."""
 
     session_path = f"{SESSION_NAME}.session"
     if os.path.exists(session_path):
@@ -199,14 +205,26 @@ def _restore_session_from_env() -> None:
 
     b64 = os.getenv("TELEGRAM_SESSION_B64")
     if not b64:
+        parts = []
+        i = 1
+        while True:
+            part = os.getenv(f"TELEGRAM_SESSION_B64_{i}")
+            if not part:
+                break
+            parts.append(part)
+            i += 1
+        if parts:
+            b64 = "".join(parts)
+
+    if not b64:
         return
 
     try:
         with open(session_path, "wb") as f:
             f.write(base64.b64decode(b64))
-        logger.info("Восстановил файл сессии из TELEGRAM_SESSION_B64")
+        logger.info("Восстановил файл сессии из переменных окружения (TELEGRAM_SESSION_B64*)")
     except Exception:
-        logger.exception("Не удалось восстановить сессию из TELEGRAM_SESSION_B64")
+        logger.exception("Не удалось восстановить сессию из переменных окружения (TELEGRAM_SESSION_B64*)")
 
 
 async def resolve_chat(client: TelegramClient, chat_ref: str):
