@@ -100,7 +100,7 @@ async def _send_as_reply_to_archived(
     в нужной теме форума (archive_topic_id).
 
     client.send_message()/client.send_file() тут не подходят: их reply_to
-    проходит через telethon.utils.get_message_id(), который принимает
+    просодит через telethon.utils.get_message_id(), который принимает
     только int или Message и падает с TypeError на InputReplyToMessage —
     а чтобы ответить именно на сообщение ВНУТРИ темы (а не на само
     открывающее сообщение темы), протоколу нужен InputReplyToMessage сразу
@@ -265,33 +265,25 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
     # падает в общую тему. Если пары нет (например, ответ на сообщение из
     # истории до запуска скрипта) — просто уходит в тему, как раньше.
     #
-    # Картинки: в этом чате пересылка запрещена (noforwards), поэтому
-    # Forward и переиспользование file_reference (как в handle_mirror_message)
-    # тут не сработают — Telegram специально блокирует именно это. Обходим
-    # так же, как обычный человек делает вручную: скачиваем байты фото и
-    # заливаем их заново как новый, свой собственный файл — это уже не
-    # "пересылка" и не переиспользование чужого file_reference, а обычная
-    # загрузка, так что запрет тут ни при чём.
-    has_photo = bool(event.message.photo)
-    if archive_entity is not None and (text.strip() or has_photo):
+    # Картинки в архив СОЗНАТЕЛЬНО не дублируем. В этом чате пересылка
+    # запрещена (noforwards), так что пришлось бы скачивать байты фото и
+    # заливать их заново как новый файл (через download_media/upload_file) —
+    # на практике именно это иногда ловило PhotoExtInvalidError от Telegram
+    # и подвешивало обработку на десятки секунд (видно в логах). Чтобы не
+    # рисковать зависанием из-за одной картинки, дублируем только текст;
+    # если в сообщении с фото есть подпись — подпись уйдёт как обычный
+    # текст, а само фото просто не копируется.
+    if archive_entity is not None and text.strip():
         try:
             reply_source_id = getattr(event.message, "reply_to_msg_id", None)
             archived_parent_id = _archived_message_ids.get(reply_source_id) if reply_source_id else None
 
-            photo_bytes = None
-            if has_photo:
-                photo_bytes = await client.download_media(event.message, file=bytes)
-
             if archived_parent_id is not None:
                 # Настоящий ответ на конкретное заархивированное сообщение —
-                # client.send_message/send_file тут не подходят, см.
-                # docstring _send_as_reply_to_archived.
+                # client.send_message тут не подходит, см. docstring
+                # _send_as_reply_to_archived.
                 sent = await _send_as_reply_to_archived(
-                    client, archive_entity, text, archive_topic_id, archived_parent_id, photo_bytes
-                )
-            elif has_photo:
-                sent = await client.send_file(
-                    archive_entity, photo_bytes, caption=text or None, reply_to=archive_topic_id
+                    client, archive_entity, text, archive_topic_id, archived_parent_id
                 )
             else:
                 sent = await client.send_message(archive_entity, text, reply_to=archive_topic_id)
