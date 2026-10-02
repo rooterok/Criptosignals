@@ -33,27 +33,12 @@ from prefilter import looks_like_signal
 
 load_dotenv()
 
-# Сколько последних сообщений чата хранить как контекст для LLM-оценки —
-# сигналы в этом чате часто растянуты на несколько сообщений подряд
-# (сначала "Short BUN_USDT", затем отдельным сообщением твх/сайз и т.д.).
 CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "6"))
 _recent_messages: deque[str] = deque(maxlen=CONTEXT_SIZE)
 
-# Соответствие id сообщения в исходном чате -> id его копии в архивном чате.
-# Нужно, чтобы если в исходном чате сообщение было ответом на другое, копия в
-# архиве тоже была ответом (на копию того, другого сообщения, а не абы на
-# что). Храним только последние ARCHIVE_MAP_SIZE пар, чтобы словарь не рос
-# бесконечно при долгой работе — старые сообщения теряют этот линк, что
-# нормально (ответ на что-то настолько старое — редкость, а если он всё же
-# случится, копия просто уйдёт в общую тему, без реплая).
 ARCHIVE_MAP_SIZE = 2000
 _archived_message_ids: dict[int, int] = {}
 
-# Временная заглушка пуш-уведомлений (Pushover) — управляется командами
-# /mute, /unmute, /mutestatus, отправленными себе в Избранное (Saved
-# Messages). На дублирование сообщений в архивный чат и на сам мониторинг
-# это НЕ влияет — заглушается только звонок в Pushover, если сигнал
-# всё-таки найден.
 _push_muted_until: float | None = None
 DEFAULT_MUTE_SECONDS = int(os.getenv("DEFAULT_MUTE_SECONDS", str(60 * 60)))
 
@@ -100,7 +85,7 @@ async def _send_as_reply_to_archived(
     в нужной теме форума (archive_topic_id).
 
     client.send_message()/client.send_file() тут не подходят: их reply_to
-    просодит через telethon.utils.get_message_id(), который принимает
+    проходит через telethon.utils.get_message_id(), который принимает
     только int или Message и падает с TypeError на InputReplyToMessage —
     а чтобы ответить именно на сообщение ВНУТРИ темы (а не на само
     открывающее сообщение темы), протоколу нужен InputReplyToMessage сразу
@@ -146,15 +131,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("signal_watcher")
 
-# Раз уже бывало: скрипт молча "зависал" (Telethon переставал получать
-# обновления от Telegram без единой ошибки в логах), а Railway всё равно
-# показывал "всё ок", потому что сам процесс не падал — просто ничего не
-# делал. Из-за этого пропускались сигналы и пуши. Защита: раз в
-# WATCHDOG_INTERVAL_SECONDS дёргаем Telegram лёгким запросом (get_me) с
-# таймаутом WATCHDOG_TIMEOUT_SECONDS. Если он не проходит — значит
-# соединение мертво, и надёжнее всего просто убить процесс целиком:
-# внешний цикл в самом низу файла (while True: ... time.sleep(30))
-# поднимет его заново с чистого листа и новым соединением.
 WATCHDOG_INTERVAL_SECONDS = int(os.getenv("WATCHDOG_INTERVAL_SECONDS", "300"))
 WATCHDOG_TIMEOUT_SECONDS = int(os.getenv("WATCHDOG_TIMEOUT_SECONDS", "30"))
 
@@ -229,7 +205,6 @@ def _restore_session_from_env() -> None:
 
 async def resolve_chat(client: TelegramClient, chat_ref: str):
     """Пытается найти чат по username, числовому id или названию."""
-    # username или числовой id Telethon разрулит сам
     try:
         if chat_ref.lstrip("-").isdigit():
             return await client.get_entity(int(chat_ref))
@@ -237,7 +212,6 @@ async def resolve_chat(client: TelegramClient, chat_ref: str):
     except Exception:
         pass
 
-    # запасной вариант — поиск по точному названию среди диалогов
     async for dialog in client.iter_dialogs():
         if dialog.name == chat_ref:
             return dialog.entity
@@ -251,37 +225,12 @@ async def resolve_chat(client: TelegramClient, chat_ref: str):
 async def handle_message(event, chat_title: str, client: TelegramClient, archive_entity=None, archive_topic_id: int | None = None):
     text = event.raw_text or ""
 
-    # Дублируем КАЖДОЕ сообщение с текстом в архивный чат (если он задан),
-    # независимо от того, похоже оно на сигнал или нет — это не пересылка
-    # (forward), а обычная отправка нового сообщения с тем же текстом, так
-    # что запрет пересылки в исходном чате тут ни при чём. Если задан
-    # ARCHIVE_TOPIC_ID — отправляем в конкретную тему форум-чата: reply_to
-    # на id темы кладёт сообщение именно в неё (так же работает и в ботах
-    # через message_thread_id).
-    #
-    # Если исходное сообщение само было ответом на другое — и то, другое,
-    # мы тоже успели продублировать (есть в _archived_message_ids) — копия
-    # в архиве тоже оформляется как ответ именно на ту копию, а не просто
-    # падает в общую тему. Если пары нет (например, ответ на сообщение из
-    # истории до запуска скрипта) — просто уходит в тему, как раньше.
-    #
-    # Картинки в архив СОЗНАТЕЛЬНО не дублируем. В этом чате пересылка
-    # запрещена (noforwards), так что пришлось бы скачивать байты фото и
-    # заливать их заново как новый файл (через download_media/upload_file) —
-    # на практике именно это иногда ловило PhotoExtInvalidError от Telegram
-    # и подвешивало обработку на десятки секунд (видно в логах). Чтобы не
-    # рисковать зависанием из-за одной картинки, дублируем только текст;
-    # если в сообщении с фото есть подпись — подпись уйдёт как обычный
-    # текст, а само фото просто не копируется.
     if archive_entity is not None and text.strip():
         try:
             reply_source_id = getattr(event.message, "reply_to_msg_id", None)
             archived_parent_id = _archived_message_ids.get(reply_source_id) if reply_source_id else None
 
             if archived_parent_id is not None:
-                # Настоящий ответ на конкретное заархивированное сообщение —
-                # client.send_message тут не подходит, см. docstring
-                # _send_as_reply_to_archived.
                 sent = await _send_as_reply_to_archived(
                     client, archive_entity, text, archive_topic_id, archived_parent_id
                 )
@@ -292,10 +241,6 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
         except Exception:
             logger.exception("Не удалось продублировать сообщение в архивный чат")
 
-    # Контекст берём ДО добавления текущего сообщения, чтобы не дублировать
-    # его же самого; добавляем текущее сообщение в историю в любом случае —
-    # даже отфильтрованные локально сообщения могут быть полезным контекстом
-    # для оценки следующего.
     context = list(_recent_messages)
     if text.strip():
         _recent_messages.append(text)
@@ -376,7 +321,7 @@ async def main():
     client = TelegramClient(SESSION_NAME, api_id, api_hash)
 
     logger.info("Подключаюсь к Telegram...")
-    await client.start(phone=phone)  # при первом запуске спросит код/пароль
+    await client.start(phone=phone)
     logger.info("Подключено как %s", (await client.get_me()).username or "unknown")
 
     chat_entity = await resolve_chat(client, chat_ref)
@@ -403,13 +348,6 @@ async def main():
         except Exception:
             logger.exception("Ошибка при обработке сообщения")
 
-    # Команды управления пушами — пишете себе в Избранное (Saved Messages):
-    #   /mute        — заглушить на DEFAULT_MUTE_SECONDS (по умолчанию 1 час)
-    #   /mute 2h     — заглушить на 2 часа
-    #   /mute 90m    — заглушить на 90 минут (можно и "90 мин", "2ч30м" и т.п.)
-    #   /unmute      — снять заглушку сразу
-    #   /mutestatus  — посмотреть текущее состояние
-    # На дублирование в архив это не влияет — только на звонок в Pushover.
     @client.on(events.NewMessage(chats="me", outgoing=True))
     async def _control_handler(event):
         global _push_muted_until
@@ -442,11 +380,6 @@ async def main():
         except Exception:
             logger.exception("Ошибка при обработке команды управления пушами: %r", text)
 
-    # Доп. источник(и) только для дублирования, без анализа на сигналы —
-    # MIRROR2_SOURCE_CHAT копируется в MIRROR2_TARGET_CHAT (по умолчанию
-    # туда же, куда и основной архив — ARCHIVE_CHAT), в тему
-    # MIRROR2_TARGET_TOPIC_ID, если она задана. Понадобится ещё один такой
-    # источник — добавляйте по аналогии MIRROR3_* и т.д.
     mirror2_source_ref = os.getenv("MIRROR2_SOURCE_CHAT")
     if mirror2_source_ref:
         try:
