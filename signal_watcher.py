@@ -283,6 +283,28 @@ async def handle_message(event, chat_title: str, client: TelegramClient, archive
     send_push(title=title, message=f"[{chat_title}] {message}", url=chat_link)
 
 
+async def handle_edited_message(event, client: TelegramClient, archive_entity) -> None:
+    """Источник (антислив) сначала публикует одни значения, а через несколько
+    секунд правит сообщение. Если оригинал уже продублирован в архив —
+    правим копию на новый текст."""
+    if archive_entity is None:
+        return
+    archived_id = _archived_message_ids.get(event.message.id)
+    if archived_id is None:
+        return
+    text = event.raw_text or ""
+    if not text.strip():
+        return
+    try:
+        await client.edit_message(archive_entity, archived_id, text)
+        logger.info("Отредактировал копию в архиве (исходное сообщение %s)", event.message.id)
+    except Exception as exc:
+        # MessageNotModifiedError (текст не изменился) — не ошибка
+        if type(exc).__name__ == "MessageNotModifiedError":
+            return
+        logger.exception("Не удалось отредактировать копию сообщения в архиве")
+
+
 async def handle_mirror_message(
     event,
     client: TelegramClient,
@@ -352,6 +374,13 @@ async def main():
             await handle_message(event, chat_title, client, archive_entity, archive_topic_id)
         except Exception:
             logger.exception("Ошибка при обработке сообщения")
+
+    @client.on(events.MessageEdited(chats=chat_entity))
+    async def _edit_handler(event):
+        try:
+            await handle_edited_message(event, client, archive_entity)
+        except Exception:
+            logger.exception("Ошибка при обработке правки сообщения")
 
     @client.on(events.NewMessage(chats="me", outgoing=True))
     async def _control_handler(event):
