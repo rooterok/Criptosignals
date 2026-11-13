@@ -31,6 +31,11 @@ from evaluator import evaluate
 from notifier import send_push
 from prefilter import looks_like_signal
 
+try:
+    import parser_alerts
+except Exception:  # модуль парсеров не должен ронять основного бота
+    parser_alerts = None
+
 load_dotenv()
 
 CONTEXT_SIZE = int(os.getenv("CONTEXT_SIZE", "6"))
@@ -421,6 +426,12 @@ async def main():
                 "проверьте, что chat id верный и аккаунт состоит в этом чате",
                 mirror2_source_ref,
             )
+
+    if parser_alerts is not None:
+        try:
+            parser_alerts.register(client)
+        except Exception:
+            logger.exception("Не удалось подключить parser_alerts")
 
     asyncio.create_task(_connection_watchdog(client))
 
