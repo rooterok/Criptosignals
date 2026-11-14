@@ -25,7 +25,10 @@ parser_alerts.py — фильтр каналов-парсеров для signal-
     FEED_MIN_MOVE=50       Gate | Feed: движение цены
     FAIR_LAST_MIN=8        FAIR / LAST PRICE SPREAD (бот и сам шлёт от 8%)
     SPLASH_MIN=100         splash-каналы: движение цены
-    SPLASH_GAP_MIN=15      splash-каналы: отрыв last от справедливой
+    SPLASH_GAP_MIN=40      splash-каналы: отрыв last от справедливой
+    SPLASH_GAP_MAX=1000    отрыв больше этого = мусорный fair, игнорируем
+    SPLASH_MIN_VOL=150000  splash: минимальный объём 24h ($)
+    SPLASH_COOLDOWN=900    splash: не чаще 1 пуша в N сек на канал
     KORM_MIN=30            Mexc Price | Kormushka
 
 Пуши идут обычным приоритетом (0): не будят ночью и не пробивают режим «не беспокоить».
@@ -70,7 +73,10 @@ FEED_MIN_FAIR_GAP = _env_f("FEED_MIN_FAIR_GAP", 20)
 FEED_MIN_MOVE = _env_f("FEED_MIN_MOVE", 50)
 FAIR_LAST_MIN = _env_f("FAIR_LAST_MIN", 8)
 SPLASH_MIN = _env_f("SPLASH_MIN", 100)
-SPLASH_GAP_MIN = _env_f("SPLASH_GAP_MIN", 15)
+SPLASH_GAP_MIN = _env_f("SPLASH_GAP_MIN", 40)
+SPLASH_GAP_MAX = _env_f("SPLASH_GAP_MAX", 1000)      # больше — fair мусорный, отрыв игнорируем
+SPLASH_MIN_VOL = _env_f("SPLASH_MIN_VOL", 150000)    # объём 24h в $, ниже — монета слишком тонкая
+SPLASH_COOLDOWN = _env_f("SPLASH_COOLDOWN", 900)     # не чаще 1 пуша за N секунд на splash-канал
 KORM_MIN = _env_f("KORM_MIN", 30)
 
 
@@ -113,6 +119,17 @@ def _extras(text: str, labels: list[str]) -> str:
         if v:
             parts.append(f"{lb} {v}")
     return " · ".join(parts)
+
+
+def _volume(text: str) -> Optional[float]:
+    m = re.search(r"Volume\s*24h\s*:?\s*\$?\s*([\d.,]+)\s*([kKmM]?)", text)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None
+    return v * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()]
 
 
 def _gap(last: float, ref: float) -> Optional[float]:
@@ -250,9 +267,12 @@ def rule_splash(chan: str, text: str) -> Optional[Result]:
     metric = f"chg {chg:+.1f}%" + (f" gap_vs_fair {gap:+.1f}%" if gap is not None else "")
     res = Result(ticker, metric)
     parts = []
+    vol = _volume(text)
+    if vol is not None and vol < SPLASH_MIN_VOL:
+        return res  # слишком тонкая монета — не пушим
     if abs(chg) >= SPLASH_MIN:
         parts.append(f"движение {chg:+.0f}%")
-    if gap is not None and abs(gap) >= SPLASH_GAP_MIN:
+    if gap is not None and SPLASH_GAP_MIN <= abs(gap) <= SPLASH_GAP_MAX:
         parts.append(f"last против справедливой {gap:+.0f}%")
     if parts:
         msg = f"{ticker}: " + "; ".join(parts)
@@ -340,13 +360,14 @@ def evaluate(chan_title: str, text: str) -> Optional[Result]:
 _seen: dict[str, float] = {}
 
 
-def _is_dup(key: str) -> bool:
+def _is_dup(key: str, seconds: Optional[float] = None) -> bool:
+    window = DEDUPE_SECONDS if seconds is None else seconds
     now = time.time()
     if len(_seen) > 500:
-        for k in [k for k, ts in _seen.items() if now - ts > DEDUPE_SECONDS]:
+        for k in [k for k, ts in _seen.items() if now - ts > max(window, DEDUPE_SECONDS)]:
             _seen.pop(k, None)
     last = _seen.get(key)
-    if last is not None and now - last < DEDUPE_SECONDS:
+    if last is not None and now - last < window:
         return True
     _seen[key] = now
     return False
@@ -380,6 +401,9 @@ async def handle_post(chan_title: str, text: str, link: str = "") -> Optional[Al
         log.info("PARSER_SEEN | %s | %s | %s", chan_title, res.ticker, res.metric)
     alert = res.alert
     if alert is None or _is_dup(alert.key):
+        return None
+    if alert.key.startswith("splash:") and _is_dup("chan:" + chan_title, SPLASH_COOLDOWN):
+        log.info("PARSER_SKIP cooldown | %s | %s", chan_title, alert.message.split("\n")[0])
         return None
     log.info("PARSER_ALERT mode=%s | %s | %s", MODE, chan_title, alert.message.replace("\n", " | "))
     if MODE == "live" and PUSHOVER_TOKEN and PUSHOVER_USER:
